@@ -1,0 +1,1271 @@
+/*
+ *      Realtek VLAN handler
+ *
+ *      $Id: rtk_vlan.c,v 1.5 2009/06/09 12:58:30 davidhsu Exp $
+ */
+
+#include <linux/config.h>
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/compiler.h>
+#include <linux/netdevice.h>
+#include <linux/if_ether.h>
+#include <linux/if_vlan.h>
+#include <asm/string.h>
+#include <net/rtl/rtk_vlan.h>
+#include <net/rtl/rtl_nic.h>
+
+
+//---------------------------------------------------------------------------
+
+#if 0
+#define DEBUG_ERR(format, args...) panic_printk("%s [%s]: "format, __FUNCTION__, dev->name, ## args)
+#else
+#define DEBUG_ERR(format, args...)
+#endif
+
+
+#if 0
+#define DEBUG_TRACE(format, args...) panic_printk("%s [%s]: "format, __FUNCTION__, dev->name, ## args)
+#else
+#define DEBUG_TRACE(format, args...)
+#endif
+
+#ifdef RTK_HW_VLAN_NEW_FEATURE
+#define RTK_WAN_PORT_IDX (ffs(RTL_WANPORT_MASK) - (1))
+
+extern int RTK_MC_VLANID;//from rtl_nic.c
+extern __DRAM_FWD int rtl_hw_vlan_enable;
+extern int is_rtl_nat_vlan(struct sk_buff *skb);  
+extern int is_rtl_manage_vlan_tagged(struct sk_buff *skb, uint16 *vid);
+extern int is_rtl_mc_vlan_tagged(uint16 *vid);
+extern int is_rtl_mc_vlan_tagged2(struct sk_buff *skb, uint16 *vid);
+#if defined(CONFIG_RTL_TR069_WAN)
+int is_rtl_manage_vlan_tagged2(struct sk_buff *skb, uint16 *vid);
+#endif
+extern int is_rtl_wan_mac(struct sk_buff *skb);
+extern struct net_device *rtl_get_dev_by_vid(uint16 vid);
+extern struct vlan_info *rtl_get_vinfo_by_vid(uint16 vid);
+extern int is_rtl_multi_nat_vlan (struct sk_buff *skb, uint16 *vid); 
+
+extern struct net_device *rtl_get_man_dev(void);
+extern struct vlan_info *rtl_get_man_vlaninfo(void);
+#if defined(CONFIG_RTL_IGMP_VLAN_SUPPORT)
+extern struct vlan_info igmp_vlan_info;
+extern int rtl_is_igmp_pkt(struct sk_buff *skb);
+extern int rtl_check_igmpproxy_vlan_tagged(struct sk_buff *skb);
+#endif
+
+static uint16 get_skb_vid( struct sk_buff *skb)
+{
+     uint16 vid=0; //untag or NoVlan group	 
+     
+     if( skb->tag.f.tpid == htons(ETH_P_8021Q) )
+		vid = ntohs(skb->tag.f.pci & 0xfff);	
+
+    return vid;
+}
+
+static int  eth_insert_vlan_tag(struct sk_buff *skb , uint16 vid) 
+{
+	struct vlan_tag tag,*adding_tag;
+	adding_tag = &skb->tag;
+       adding_tag->f.tpid = htons(ETH_P_8021Q); 
+	adding_tag->f.pci = (0xf000 & adding_tag->f.pci) | (0xfff & vid) ; //reset tag info and insert		
+	
+        memcpy(&tag, skb->data+ETH_ALEN*2, VLAN_HLEN);	
+	 if (tag.f.tpid !=  htons(ETH_P_8021Q)) { // tag not existed, insert tag	
+		if (skb_headroom(skb) < VLAN_HLEN && skb_cow(skb, VLAN_HLEN) !=0 ) {
+				printk("%s-%d: error! (skb_headroom(skb) == %d < 4). Enlarge it!\n",
+				__FUNCTION__, __LINE__, skb_headroom(skb));
+				while (1) ;
+		}
+			skb_push(skb, VLAN_HLEN);
+			memmove(skb->data, skb->data+VLAN_HLEN, ETH_ALEN*2);
+	    		
+			memcpy(skb->data+ETH_ALEN*2, adding_tag, VLAN_HLEN);     
+	}	
+	return 0;
+}
+#if defined(CONFIG_RTL_HW_VLAN_PRI)
+int  eth_insert_vlan_vid_pri(struct sk_buff *skb , uint16 vid, uint16 pri) 
+{
+	struct vlan_tag tag,*adding_tag;
+	adding_tag = &skb->tag;
+	   adding_tag->f.tpid = htons(ETH_P_8021Q); 
+	adding_tag->f.pci = (0xf000 & adding_tag->f.pci) | (0xfff & vid) ; //reset tag info and insert		
+	adding_tag->f.pci = (0x1fff & adding_tag->f.pci) | ((0x7 & pri)<<13) ; //reset pri info and insert	
+	
+	memcpy(&tag, skb->data+ETH_ALEN*2, VLAN_HLEN);	
+	 if (tag.f.tpid !=	htons(ETH_P_8021Q)) { // tag not existed, insert tag	
+		if (skb_headroom(skb) < VLAN_HLEN && skb_cow(skb, VLAN_HLEN) !=0 ) {
+				printk("%s-%d: error! (skb_headroom(skb) == %d < 4). Enlarge it!\n",
+				__FUNCTION__, __LINE__, skb_headroom(skb));
+				while (1) ;
+		}
+			skb_push(skb, VLAN_HLEN);
+			memmove(skb->data, skb->data+VLAN_HLEN, ETH_ALEN*2);
+				
+			memcpy(skb->data+ETH_ALEN*2, adding_tag, VLAN_HLEN);	 
+	}	
+	return 0;
+}
+
+
+#endif
+#endif
+
+#if defined(CONFIG_RTK_VLAN_NEW_FEATURE)
+#if defined(CONFIG_RTL_CUSTOM_PASSTHRU)
+#if defined(CONFIG_RTL_TR069_WAN)
+#define MAX_IFACE_VLAN_CONFIG 19
+#else
+#define MAX_IFACE_VLAN_CONFIG 18
+#endif
+#else
+#if defined(CONFIG_RTL_TR069_WAN)
+#define MAX_IFACE_VLAN_CONFIG 19
+#else
+#define MAX_IFACE_VLAN_CONFIG 18
+#endif
+#endif
+#define WAN_IFACE_INDEX MAX_IFACE_VLAN_CONFIG-1
+#define VIRTUAL_IFACE_INDEX MAX_IFACE_VLAN_CONFIG-2
+
+#if defined(CONFIG_RTL_CUSTOM_PASSTHRU)
+#define PASSTHRU_IFACE_INDEX (MAX_IFACE_VLAN_CONFIG-3)
+#define MAX_IFACE_INDEX		PASSTHRU_IFACE_INDEX
+#else
+#define MAX_IFACE_INDEX		VIRTUAL_IFACE_INDEX
+#endif
+
+static struct vlan_info_item vlan_info_items[MAX_IFACE_VLAN_CONFIG];
+static unsigned char wan_macaddr[6] = {0};
+unsigned char lan_macaddr[6] = {0};
+
+unsigned char BRCST_MAC[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+static unsigned short eth_arp = 0x0806;
+
+int is_management_packets(struct sk_buff *skb)
+{
+	/*add code to check whether skb is management pacekts*/
+	return 0;
+}
+
+
+struct net_device *rtl_get_wan_from_vlan_info(void)
+{
+	return vlan_info_items[WAN_IFACE_INDEX].dev;
+}
+
+struct net_device* rtl_get_virtual_dev_from_vlan_info(void)
+{
+	return vlan_info_items[VIRTUAL_IFACE_INDEX].dev;
+}
+
+#if defined(CONFIG_RTL_CUSTOM_PASSTHRU)	
+struct net_device* rtl_get_passthru_dev_from_vlan_info(void)
+{
+	return vlan_info_items[PASSTHRU_IFACE_INDEX].dev;
+}
+
+#endif
+struct net_device *rtl_get_dev_bridged_with_wan(void)
+{
+	int index;
+
+	for(index=0 ;index<MAX_IFACE_INDEX ; index++) {
+		if( vlan_info_items[index].info.forwarding_rule == 1 )		/*forwarding_rule = 1 means dev bridged with wan dev*/
+			return vlan_info_items[index].dev;
+	}
+
+	return NULL;
+}
+
+
+struct vlan_info_item *rtl_get_vlan_info_item_by_vid(int vid)
+{
+	struct vlan_info_item *item = NULL;
+	int index;
+	
+	for(index=0; index<MAX_IFACE_INDEX; index++) {
+		item = &vlan_info_items[index];
+		if( item->dev && item->info.id == vid )
+			return item;
+	}
+
+	return NULL;
+}
+
+struct vlan_info_item *rtl_get_vlan_info_item_by_dev(struct net_device *dev)
+{
+	struct vlan_info_item *item = NULL;
+	int index;
+
+	for(index=0; index<MAX_IFACE_VLAN_CONFIG; index++) {
+		item = &vlan_info_items[index];
+		if( item->dev && (memcmp(dev->name, item->dev->name,16) == 0) ) {	// IFNAMSIZ = 16
+			DEBUG_TRACE("found in list id:%d, is LAN:%d, enable:%d\n",item->info.id,item->info.is_lan,item->info.vlan);
+			return item;
+		}
+	}
+
+	return NULL;
+}
+
+
+int rtl_add_vlan_info(struct vlan_info *info, struct net_device *dev)
+{
+	struct vlan_info_item *item = NULL;
+	int index;
+
+	if( memcmp(dev->name,"eth0",4) == 0 ){
+		memcpy(lan_macaddr, dev->dev_addr, 6);
+	}
+
+
+	if( memcmp(dev->name,"eth1",4) == 0 ){
+		item = &vlan_info_items[WAN_IFACE_INDEX];
+
+		memset(item, 0, sizeof(struct vlan_info_item));
+		memcpy(&item->info, info, sizeof(struct vlan_info));
+		item->dev = dev;
+		memcpy(wan_macaddr, dev->dev_addr, 6);
+
+		DEBUG_TRACE("WAN port vlan id:%d, is LAN:%d, fowarding:%d\n",item->info.id,item->info.is_lan,item->info.forwarding_rule);
+		return 0;
+	}
+
+	if( memcmp(dev->name,"eth7",4) == 0 ){
+		item = &vlan_info_items[VIRTUAL_IFACE_INDEX];
+
+		memset(item, 0, sizeof(struct vlan_info_item));
+		#if 0
+		for(index=0; index<VIRTUAL_IFACE_INDEX; index++) {
+			if( vlan_info_items[index].info.forwarding_rule == 1 ) {
+				memcpy(info,&vlan_info_items[index].info,sizeof(*info));
+				info = &vlan_info_items[index].info;
+				break;
+			}
+		}
+		#endif
+		memcpy(&item->info, info, sizeof(struct vlan_info));
+		item->dev = dev;
+		DEBUG_TRACE("Virtual port vlan id:%d, is LAN:%d, fowarding:%d\n",item->info.id,item->info.is_lan,item->info.forwarding_rule);
+		return 0;
+	}
+	
+#if defined(CONFIG_RTL_CUSTOM_PASSTHRU)	
+	if( memcmp(dev->name,"peth",4) == 0 ){
+		item = &vlan_info_items[PASSTHRU_IFACE_INDEX];
+
+		memset(item, 0, sizeof(struct vlan_info_item));
+		memcpy(&item->info, info, sizeof(struct vlan_info));
+		item->dev = dev;
+		DEBUG_TRACE("passthru dev vlan id:%d, is LAN:%d, fowarding:%d\n",item->info.id,item->info.is_lan,item->info.forwarding_rule);
+		return 0;
+	}
+#endif	
+	if((item = rtl_get_vlan_info_item_by_dev(dev)) != NULL){
+                memcpy(&item->info, info, sizeof(struct vlan_info));
+                return 0;
+        }
+
+	for(index=0; index<MAX_IFACE_VLAN_CONFIG; index++) {
+		if( vlan_info_items[index].dev == NULL ) {
+			item = &vlan_info_items[index];
+
+			memset(item, 0, sizeof(*item));
+			memcpy(&item->info, info, sizeof(*info));
+			item->dev = dev;
+
+			DEBUG_TRACE("insert vlan id:%d, is LAN:%d, enable:%d\n",item->info.id,item->info.is_lan,item->info.vlan);
+			return 0;
+		}
+	}
+
+	if( item == NULL ) {
+		DEBUG_ERR("VLAN info. list is FULL\n");
+		return -1;
+	}
+}
+
+int rtl_delete_vlan_info(struct net_device *dev)
+{
+	struct vlan_info_item *item = NULL;
+
+	if((item = rtl_get_vlan_info_item_by_dev(dev)) != NULL){
+		memset(item, 0, sizeof(struct vlan_info_item));
+		return 0;
+	} else {
+		DEBUG_ERR("Delete dev from vlan_info_items failed\n");
+		return -1;
+	}
+}
+
+#endif
+
+
+//---------------------------------------------------------------------------
+
+
+#define COPY_TAG(tag, info) { \
+	tag.f.tpid =  htons(ETH_P_8021Q); \
+	tag.f.pci = (unsigned short) (((((unsigned char)info->pri)&0x7) << 13) | \
+					((((unsigned char)info->cfi)&0x1) << 12) |((unsigned short)info->id&0xfff)); \
+	tag.f.pci =  htons(tag.f.pci);	\
+}
+
+
+#define STRIP_TAG(skb) { \
+	memmove(skb->data+VLAN_HLEN, skb->data, ETH_ALEN*2); \
+	skb_pull(skb, VLAN_HLEN); \
+}
+
+#if defined(CONFIG_RTL_HW_VLAN_WIFI_BRIDGE)
+#include "rtl819x/common/rtl865x_vlan.h"
+#include "rtl819x/AsicDriver/rtl865x_asicCom.h"
+
+#define RTK_CPU_PORT 8
+#define RTL_CPUPORT_MASK (1 << RTK_CPU_PORT)
+#define MAX_WIFI_IFACE 12 /* (1 root + 4 vap + 1 vxd)*2 */
+
+struct vlan_info_item wlan_vlan_info[MAX_WIFI_IFACE] = {0};
+int wlan_bridge_num = 0;
+int wlan_untag_bridge_num = 0;
+
+extern int rtl_change_dev_ornot_by_vid(uint16 vid);
+extern struct net_device* rtl_get_virtual_bridge_dev(void);
+extern struct vlan_info* rtl_get_virtual_bridge_dev_info(void);
+extern void rtl_to_protocol_stack(struct sk_buff *skb, struct dev_priv *cp_this);
+extern void rtl_update_dev_cp(struct net_device *old_dev, struct net_device *new_dev);
+extern void rtl_update_dev_cp_vlan_setting(struct net_device *dev, struct vlan_info *info);
+#if defined(CONFIG_RTL8192CD)
+extern int rtl_update_wlan_vlan_info(struct net_device *dev, unsigned short vid);
+#endif
+
+int rtl_add_wlan_vlan_info(struct vlan_info *info, struct net_device *dev)
+{
+	struct vlan_info_item *item = NULL;
+	int index = 0;
+
+	if (!info || !dev)
+		return -1;
+	
+	for(index=0; index<MAX_WIFI_IFACE; index++) {
+		//exist or not?
+		item = &wlan_vlan_info[index];
+		if((item->dev != NULL) && (dev == item->dev))
+		{
+			//exist , just update.
+			memset(item, 0, sizeof(*item));
+			memcpy(&item->info, info, sizeof(*info));
+			item->dev = dev;
+			//panic_printk("replace vlan id:%d, is LAN:%d, enable:%d wlan_bridge_num=%d \n",item->info.id,item->info.is_lan,item->info.vlan, wlan_bridge_num);
+			return 0;
+		}
+		//non-exist 
+		if(item->dev == NULL) {
+			//item = &wlan_vlan_info[index];
+
+			memset(item, 0, sizeof(*item));
+			memcpy(&item->info, info, sizeof(*info));
+			item->dev = dev;			
+			//panic_printk("insert vlan id:%d, is LAN:%d, enable:%d wlan_bridge_num=%d \n",item->info.id,item->info.is_lan,item->info.vlan, wlan_bridge_num);
+			return 0;
+		}
+	}
+
+	if( item == NULL ) {
+		DEBUG_ERR("VLAN info. list is FULL\n");
+		return -1;
+	}
+
+}
+
+int rtl_found_wlan_vlan_info_byvid(uint16 vid, struct vlan_info_item *vlan_info)
+{
+	struct vlan_info_item *item = NULL;
+	int index = 0;
+
+	for(index=0; index<MAX_WIFI_IFACE; index++) {
+		if( wlan_vlan_info[index].dev != NULL ) {
+			item = &wlan_vlan_info[index];
+			if (item->info.global_vlan && item->info.vlan && (item->info.forwarding_rule==1))
+			{
+				if (item->info.id == vid)
+				{
+					//found 
+					if (vlan_info)
+					{
+						memcpy(&vlan_info->info, &item->info, sizeof(struct vlan_info));
+						vlan_info->dev = item->dev;
+					}
+					return 1;
+				}
+			}
+		}
+	}
+
+	//not found
+	return 0;
+}
+
+int rtl_found_wlan_vlan_info_byname(unsigned char *name, struct vlan_info_item *vlan_info)
+{
+	struct vlan_info_item *item = NULL;
+	int index = 0;
+
+	if (!name)
+		return 0;
+	
+	for(index=0; index<MAX_WIFI_IFACE; index++) {
+		if( wlan_vlan_info[index].dev != NULL ) {
+			item = &wlan_vlan_info[index];
+			
+			if (!memcmp(name, item->dev->name, strlen(name)))
+			{
+				//found 
+				if (vlan_info)
+				{
+					memcpy(&vlan_info->info, &item->info, sizeof(struct vlan_info));
+					vlan_info->dev = item->dev;
+				}
+				return 1;
+			}
+		}
+	}
+
+	//not found
+	return 0;
+}
+
+int rtl_add_hw_vlan_for_wlan(int mc_vid, int mc_tag, int nat_tag)
+{
+	
+	struct vlan_info_item *item = NULL;
+	int index = 0, ret = 0;
+	rtl865x_tblAsicDrv_vlanParam_t vlan;
+	unsigned short vid = 0;
+	uint32 portmsk = 0, untagmsk = 0, fid = 0;
+	extern uint32 r8367_cpu_port;
+	
+	wlan_bridge_num = wlan_untag_bridge_num = 0;
+	
+	if(!rtl_hw_vlan_enable)
+		return 0;
+	
+	//panic_printk("%s %d mc_vid = %d , mc_tag = %d \n", __FUNCTION__, __LINE__, mc_vid,mc_tag);
+	for(index=0; index<MAX_WIFI_IFACE; index++) {
+		if( wlan_vlan_info[index].dev != NULL ) {
+			item = &wlan_vlan_info[index];
+			
+			if (item->info.global_vlan && item->info.vlan && (item->info.forwarding_rule==1))
+				wlan_bridge_num++;
+			
+			if (item->info.global_vlan && item->info.vlan && (item->info.forwarding_rule==1) && (!item->info.tag))
+				wlan_untag_bridge_num++;
+
+			if (item->info.global_vlan && item->info.vlan && (item->info.forwarding_rule==1))
+			{	
+				//check wlan bridge vid tag or not, if untag, always belong to untag multicast vlan group
+				if ((mc_tag == 0) && (item->info.tag == 0))
+				{
+					item->info.id = mc_vid;
+					#if defined(CONFIG_RTL8192CD)
+					rtl_update_wlan_vlan_info(item->dev, item->info.id);
+					#endif
+				}
+				
+				vid = item->info.id;
+				ret = rtl8651_findAsicVlanIndexByVid(&vid);
+				//panic_printk("%s %d item->info.id = %d , vid = %d ret=%d wlan_bridge_num=%d wlan_untag_bridge_num=%d \n", __FUNCTION__, __LINE__, item->info.id,vid, ret, wlan_bridge_num, wlan_untag_bridge_num);
+				if ( (ret == SUCCESS) && rtl8651_getAsicVlan(vid, &vlan ) == SUCCESS )
+				{
+					//exist, update vlan info
+					//panic_printk("%s %d item->info.id = %d , vid = %d vlan.fid=%d \n", __FUNCTION__, __LINE__, item->info.id,vid, vlan.fid);				
+					rtl865x_addVlanPortMember(vid, RTL_WANPORT_MASK | RTL_CPUPORT_MASK);
+					if (item->info.tag)						
+						rtl865x_setVlanPortTag(vid, RTL_WANPORT_MASK | RTL_CPUPORT_MASK, 1);
+
+					if (!mc_tag && !nat_tag)
+					{
+						ret = rtl865x_setVlanFilterDatabase(item->info.id, 1);
+						//panic_printk("%s %d vid = %d item->info.id=%d ret=%d \n", __FUNCTION__, __LINE__, vid,item->info.id, ret);				
+					}
+				}
+				else
+				{
+					//panic_printk("%s %d item->info.id = %d , vid = %d \n", __FUNCTION__, __LINE__, item->info.id,vid);
+					rtl865x_addVlan(item->info.id);
+					rtl865x_addVlanPortMember(item->info.id, RTL_WANPORT_MASK | RTL_CPUPORT_MASK);
+					if (item->info.tag)
+						rtl865x_setVlanPortTag(item->info.id, RTL_WANPORT_MASK | RTL_CPUPORT_MASK, 1);
+					rtl865x_setVlanFilterDatabase(item->info.id, 0);
+				}
+				
+				#if defined(CONFIG_RTL_8367R_SUPPORT)
+				ret = rtk_vlan_get(item->info.id, &portmsk, &untagmsk, &fid);
+				if (ret == 0)
+				{	
+					//if vlan already exist.  tag behavior should consistency. fix me??????
+					portmsk |= (RTL_WANPORT_MASK |BIT(r8367_cpu_port));
+					//if (item->info.tag) 	
+						//untagmsk &= (~RTL_WANPORT_MASK);
+					
+					rtk_vlan_set(item->info.tag, portmsk, untagmsk, fid);
+				}
+				else
+				{
+					if(item->info.tag)
+						ret=rtk_vlan_set(item->info.tag, RTL_WANPORT_MASK |BIT(r8367_cpu_port) , 0, 0); 
+					else 
+						ret=rtk_vlan_set(item->info.tag, RTL_WANPORT_MASK |BIT(r8367_cpu_port) , RTL_WANPORT_MASK |BIT(r8367_cpu_port) , 0); 
+				}
+				#endif
+			}
+
+			DEBUG_TRACE("insert vlan id:%d, is LAN:%d, enable:%d\n",item->info.id,item->info.is_lan,item->info.vlan);
+			//return 0;
+		}
+	}
+
+}
+
+int rtl_get_wlan_bridge_num(void)
+{
+	return wlan_bridge_num;
+}
+int rtl_get_wlan_untag_bridge_num(void)
+{
+	return wlan_untag_bridge_num;
+}
+
+int rtl_rx_tag_handle(uint16 vid, struct net_device *dev, struct vlan_info *info_ori, struct sk_buff *skb)
+{
+	int ret = 0;
+	struct vlan_info_item vlan_info = {0};
+	struct vlan_info *info;
+	struct net_device *vir_dev;
+	
+	if (!dev || !info_ori || !skb)
+		return -1;
+	
+	if (wlan_bridge_num)
+	{
+		
+		ret = rtl_change_dev_ornot_by_vid(vid);
+		//panic_printk("%s %d ret=%d vid=%d \n", __FUNCTION__, __LINE__, ret, vid);
+		if (ret)
+		{
+			//change dev to eth9...			
+			ret = rtl_found_wlan_vlan_info_byvid(vid, &vlan_info);
+			//panic_printk("%s %d ret=%d vid=%d \n", __FUNCTION__, __LINE__, ret, vid);
+			if (ret)
+			{	
+				info = &vlan_info.info;
+				vir_dev = rtl_get_virtual_bridge_dev();
+				//rtl_update_dev_cp(skb->dev, vir_dev);
+				skb->dev = vir_dev;	
+				
+				//rtl_update_dev_cp_vlan_setting(skb->dev, info);
+				//COPY_TAG(skb->tag, info);
+       			skb->tag.f.tpid = htons(ETH_P_8021Q); 
+				skb->tag.f.pci = (0xf000 & skb->tag.f.pci) | (0xfff & info->id) ;
+				//panic_printk("%s %d ret=%d vid=%d skb->tag.f.pci=%d vlan_info.info.tag=%d \n", __FUNCTION__, __LINE__, ret, vid, skb->tag.f.pci, vlan_info.info.id);
+				return 0;
+			}
+			
+		}
+	}
+
+	return -1;
+}
+
+int rtl_rx_untag_handle(struct net_device *dev, struct vlan_info *info_ori, struct sk_buff *skb)
+{
+	 unsigned char natwan_macaddr[6] = {0};
+	 unsigned char tr069wan_macaddr[6] = {0};
+	 unsigned char wan3_macaddr[6] = {0};
+	 unsigned char wan4_macaddr[6] = {0};
+	 struct net_device *tr069_dev = NULL;
+	 struct net_device *wan3_dev = NULL;
+	 struct net_device *wan4_dev = NULL;
+	 struct net_device *nat_dev = NULL;
+	 struct sk_buff *new_skb = NULL;
+	 unsigned char BRCST_MAC[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+	 struct net_device *vir_dev = NULL;
+	 struct net_device *mc_dev = NULL;
+	 struct vlan_info *mc_info = NULL;
+	 
+	if (wlan_bridge_num && wlan_untag_bridge_num)
+	{
+		#if defined(CONFIG_RTL_TR069_WAN)
+		if ((tr069_dev = __dev_get_by_name(&init_net, RTL_DRV_WAN2_NETIF_NAME)) != NULL)
+		{
+			memcpy(tr069wan_macaddr, tr069_dev->dev_addr, 6);
+		}
+		#endif
+		if ((nat_dev = __dev_get_by_name(&init_net, RTL_DRV_WAN0_NETIF_NAME)) != NULL)
+		{
+			memcpy(natwan_macaddr, nat_dev->dev_addr, 6);
+		}
+		
+		if ((!memcmp(natwan_macaddr, skb->data, 6)) || (!memcmp(tr069wan_macaddr, skb->data, 6)) || (!memcmp(wan3_macaddr, skb->data, 6)) || (!memcmp(wan4_macaddr, skb->data, 6)) ){  /*unicast for nat*/
+			//do nothing
+		}
+		else
+		{
+			mc_dev=rtl_get_dev_by_vid(RTK_MC_VLANID);
+			mc_info = rtl_get_vinfo_by_vid(RTK_MC_VLANID);
+			if(!((skb->data[0] & 0x01) &&(skb->data[0] != 0xFF )&&(RTK_MC_VLANID !=0) && (mc_dev)&&mc_info))
+			{
+				//only wifi bridge with wan untag clone packets
+				//multicast and broadcast and unicast for bridge, clone new skb for wlan untag bridge
+				skb->src_info = info_ori;
+				new_skb = skb_clone(skb, GFP_ATOMIC);
+				if (new_skb == NULL) {
+					DEBUG_ERR("skb_clone() failed!\n");
+				}
+				else 
+				{
+					struct vlan_info *new_info =  rtl_get_virtual_bridge_dev_info();
+					vir_dev = rtl_get_virtual_bridge_dev();
+					new_skb->dev = vir_dev;
+					if(new_skb->dev == NULL)
+						return FAILED;
+					//untag bridge vlan  always belong to special multicast vlan group RTK_MC_VLANID
+					new_skb->tag.f.tpid = htons(ETH_P_8021Q); 
+					new_skb->tag.f.pci = (0xf000 & new_skb->tag.f.pci) | (0xfff & RTK_MC_VLANID) ;
+					new_skb->src_info = new_info;
+					new_skb->src_info->index=1;
+					#if defined (CONFIG_RTL_HARDWARE_MULTICAST)
+					new_skb->srcVlanId = RTK_MC_VLANID;
+					new_skb->srcPort = RTK_WAN_PORT_IDX;
+					#endif
+					//send to protocol 
+					rtl_to_protocol_stack(new_skb, new_skb->dev->priv);
+				}
+			}
+			
+		}
+	}
+
+	return 0;
+}
+#endif
+
+
+//---------------------------------------------------------------------------
+
+#if defined(CONFIG_RTK_VLAN_FOR_CABLE_MODEM)
+extern int rtk_vlan_support_enable;
+#endif
+
+#if defined(CONFIG_RTK_VLAN_NEW_FEATURE) || defined(RTK_HW_VLAN_NEW_FEATURE)
+__IRAM_FWD
+int  rx_vlan_process(struct net_device *dev, struct vlan_info *info_ori, struct sk_buff *skb, struct sk_buff **new_skb)
+#else
+int  rx_vlan_process(struct net_device *dev, struct vlan_info *info, struct sk_buff *skb)
+#endif
+{
+	struct vlan_tag tag;
+	unsigned short vid;
+
+#if defined(CONFIG_RTK_VLAN_NEW_FEATURE)
+	struct vlan_info_item *item = NULL;
+	struct vlan_info *info, info_backup;
+	memcpy(&info_backup, info_ori, sizeof(struct vlan_info)); //because may need to modify info,so create a info_backup
+	info= &info_backup;
+	if(new_skb)
+		*new_skb = NULL;
+#endif
+#ifdef RTK_HW_VLAN_NEW_FEATURE
+	struct vlan_info *info =info_ori ;
+#if defined(CONFIG_RTL_HW_VLAN_WIFI_BRIDGE)
+	int ret = -1;
+#endif
+	if(new_skb)
+		*new_skb = NULL;
+	if(!rtl_hw_vlan_enable)
+		return 0;
+#endif
+
+	DEBUG_TRACE("==> Process Rx packet\n");
+
+	if (!info->global_vlan) {
+		DEBUG_TRACE("<== Return w/o change due to gvlan not enabled\n");
+		return 0;
+	}
+
+	memcpy(&tag, skb->data+ETH_ALEN*2, VLAN_HLEN);
+
+#if defined(CONFIG_RTK_VLAN_NEW_FEATURE)
+	if (info->is_lan) {
+		skb->src_info = info_ori;
+	}
+#endif
+
+	// When port-vlan is disabled, discard tag packet
+	if (!info->vlan) {
+		if (tag.f.tpid == htons(ETH_P_8021Q)) {
+#ifdef RTK_HW_VLAN_NEW_FEATURE
+			STRIP_TAG(skb); 
+#else
+			DEBUG_ERR("<Drop> due to packet w/ tag!\n");
+			return 1;
+#endif			
+		}
+		DEBUG_TRACE("<== Return w/o change, and indicate not from vlan port enabled\n");
+		skb->tag.f.tpid = 1; // indicate this packet come from the port w/o vlan enabled
+		return 0;
+	}
+
+#if defined(CONFIG_RTK_VLAN_NEW_FEATURE)
+	if (!info->is_lan && (info->tag&0x1))   //wan port do not need to select tag
+	{
+		info->tag = 1;
+	}
+	else
+		info->tag = 0;
+#endif
+
+	// Drop all no-tag packet if port-tag is enabled
+#ifndef RTK_HW_VLAN_NEW_FEATURE
+	if (info->tag && tag.f.tpid != htons(ETH_P_8021Q)) {
+		DEBUG_ERR("<Drop> due to packet w/o tag but port-tag is enabled!\n");
+		return 1;
+	}
+	#endif
+	if (tag.f.tpid == htons(ETH_P_8021Q)) { // tag existed in incoming packet
+		if (info->is_lan) {
+			// Drop all tag packets if VID is not matched
+			vid = ntohs(tag.f.pci & 0xfff);
+			DEBUG_TRACE("rx from lan!\n");
+			if (vid != (unsigned short)info->id) {
+				DEBUG_ERR("<Drop> due to VID not matched!\n");
+				return 1;
+			}
+		}
+#ifdef RTK_HW_VLAN_NEW_FEATURE
+		else {	
+			
+			STRIP_TAG(skb); //strip here is more safe in case you need to skb_clone !!!
+			//from wan interface(p4)
+			vid = ntohs(tag.f.pci & 0xfff);	
+			#if defined(CONFIG_RTL_HW_VLAN_WIFI_BRIDGE)
+			ret = rtl_rx_tag_handle(vid, dev, info_ori, skb);
+			if (ret == 0)
+			{
+				return 0;
+			}
+			#endif
+			// MC vlan process
+			if((skb->data[0] & 0x01) && (skb->data[0] != 0xFF ) && (RTK_MC_VLANID !=0) && (vid == ntohs(RTK_MC_VLANID))) //MC_VLAN_ID= 50 defuat support 
+			{				
+				struct net_device *mc_dev=rtl_get_dev_by_vid(vid);
+				//it come from WAN port , but also belong to MC vlan (if some port belong to MC vlan)								
+				if ( (mc_dev)  && (new_skb)) { //MC vlan group exist 
+				   //  clone a  newl skb-> dev=et1  and pass up .
+						*new_skb = skb_clone(skb, GFP_ATOMIC);
+						if (*new_skb == NULL) {
+							DEBUG_ERR("skb_clone() failed!\n");
+						}
+						else {							
+							(*new_skb)->dev = skb->dev; //dev to eth1
+							COPY_TAG((*new_skb)->tag, info);	//copy eth1 iffo															
+							skb->dev = mc_dev; //change skb->dev to MC vlan
+							#if defined (CONFIG_RTL_HARDWARE_MULTICAST)
+							(*new_skb)->srcVlanId = RTK_MC_VLANID;
+							(*new_skb)->srcPort = RTK_WAN_PORT_IDX;
+							#endif
+						}
+				}
+				else  // if mc vlan not exist , just chage vlan tag to eth1 WAN nat tag
+				{
+					tag.f.pci= ntohs(info->vlan & 0xfff);
+				}		
+			}			
+#if 0  //mark_hwv , FIXME future
+			else if(is_rtl_wan_mac(skb)) //if UC to wan MAC, just tag with wan NAT tag
+				tag.f.pci= ntohs(info->vlan & 0xfff);
+#endif			
+		memcpy(&skb->tag, &tag, sizeof(struct vlan_tag));
+		#if	defined(CONFIG_RTL_QOS_8021P_SUPPORT)
+		skb->srcVlanPriority = ntohs(tag.f.pci>>13)&0x7;
+		#endif
+
+		return 0;			
+		}
+#endif
+#if defined(CONFIG_RTK_VLAN_NEW_FEATURE)
+		else {	//wan interface
+				vid = ntohs(tag.f.pci & 0xfff);
+				item = rtl_get_vlan_info_item_by_vid(vid);
+
+				if( item ) {
+					if( item->info.forwarding_rule == 1 ){
+						skb->dev = rtl_get_virtual_dev_from_vlan_info(); //return virtual interface
+						DEBUG_TRACE("vid is bridge vid\n");
+						if(skb->dev == NULL)
+							return 1;
+					} else if ( item->info.forwarding_rule == 0 ) {
+						DEBUG_TRACE("<Drop> due to VLAN is disabled\n");
+						return 1;
+					} else {  //forwarding_rule is nat
+						DEBUG_TRACE("Recv from WAN normally\n");
+					}
+				}
+			}
+#endif
+		memcpy(&skb->tag, &tag, sizeof(struct vlan_tag));
+		STRIP_TAG(skb);
+		#if	defined(CONFIG_RTL_QOS_8021P_SUPPORT)
+		skb->srcVlanPriority = ntohs(tag.f.pci>>13)&0x7;
+		#endif
+			DEBUG_TRACE("<==%s(%d)	 Tag [vid=%d] existed in Rx packet, strip it and pass up\n", __FUNCTION__,__LINE__,
+				(int)ntohs(tag.f.pci&0xfff));
+		}
+	else	 {
+		if( info->is_lan ) {
+#if defined(CONFIG_RTK_VLAN_NEW_FEATURE)
+			if(is_management_packets(skb)){
+				COPY_TAG(skb->tag, (&management_vlan));
+				DEBUG_TRACE("<== Management packet from lan, carry port tag [vid=%d] and pass up\n",
+					(int)ntohs(skb->tag.f.pci&0xfff));
+			}else
+#endif
+			{
+				COPY_TAG(skb->tag, info);
+				DEBUG_TRACE("<== No tag existed, carry port tag [vid=%d] and pass up\n",
+					(int)ntohs(skb->tag.f.pci&0xfff));
+			}
+		} else {
+#ifdef RTK_HW_VLAN_NEW_FEATURE
+			//untag from wan (p4) 
+			//MC vlan , BC not incude (will be forwad with HW layer2)
+			if((skb->data[0] & 0x01) &&(skb->data[0] != 0xFF )&& (RTK_MC_VLANID !=0) ) //MC_VLAN_ID= 50 defuat support 
+			{
+				struct net_device *mc_dev=rtl_get_dev_by_vid(RTK_MC_VLANID);
+				struct vlan_info *mc_info = rtl_get_vinfo_by_vid(RTK_MC_VLANID);
+				//it come from WAN port , but also belong to MC vlan (if some port belong to MC vlan)								
+				if ( (mc_dev) && new_skb &&(mc_info)) 
+				{ //MC vlan group exist  and it's untag group
+				     if(mc_info->tag == 0) {
+				   //  clone a  newl skb-> dev=et1  and pass up .
+						*new_skb = skb_clone(skb, GFP_ATOMIC);
+						if (*new_skb == NULL) {
+							DEBUG_ERR("skb_clone() failed!\n");
+						}
+						else {							
+							(*new_skb)->dev = skb->dev; //dev to eth1
+							COPY_TAG((*new_skb)->tag, info);	//copy eth1 iffo															
+							skb->dev = mc_dev; //change skb->dev to MC vlan											
+							info = mc_info; // copy mc info to skb tag
+							#if defined (CONFIG_RTL_HARDWARE_MULTICAST)
+							(*new_skb)->srcVlanId = RTK_MC_VLANID;
+							(*new_skb)->srcPort = RTK_WAN_PORT_IDX;
+							#endif
+						}					
+				      }	
+				}				
+			}
+			else 
+			{ //mark_manv
+				#if 0
+				struct net_device *man_dev=rtl_get_man_dev();
+				struct vlan_info *man_info = rtl_get_man_vlaninfo();
+				if ( (man_dev) && new_skb &&(man_info)) 
+				{
+					// if manag vlan enable and untag , need to duplicate to "eth7"
+				     if(man_info->tag == 0) {
+				   //  clone a  newl skb-> dev=et1  and pass up .
+						*new_skb = skb_clone(skb, GFP_ATOMIC);
+						if (*new_skb == NULL) {
+							DEBUG_ERR("skb_clone() failed!\n");
+						}
+						else {							
+							(*new_skb)->dev = skb->dev; //dev to eth1
+							COPY_TAG((*new_skb)->tag, info);	//copy eth1 iffo															
+							skb->dev = man_dev; 									
+							info = man_info; // copy mana vlan info to skb tag							
+						}					
+				      }	
+				}
+				#endif
+			
+			}			
+			// normal path
+			COPY_TAG(skb->tag, info);
+			DEBUG_TRACE("<== No tag existed, carry port tag [vid=%d] and pass up\n",
+			(int)ntohs(skb->tag.f.pci&0xfff));
+			#if defined(CONFIG_RTL_HW_VLAN_WIFI_BRIDGE)
+			///fix me???
+			rtl_rx_untag_handle(dev, info_ori, skb);
+			#endif
+			return 0;
+#endif
+#if defined(CONFIG_RTK_VLAN_NEW_FEATURE)
+				if (!memcmp(wan_macaddr, skb->data, 6)){  /*unicast for nat*/
+					 if(is_management_packets(skb)){
+						COPY_TAG(skb->tag, (&management_vlan));
+						DEBUG_TRACE("<== Management packet from wan to nat, carry port tag [vid=%d] and pass up\n",
+							(int)ntohs(skb->tag.f.pci&0xfff));
+					 }
+				}else if (skb->data[0] & 0x01){  /*multicast*/
+					skb->src_info = info_ori;
+					if (new_skb) {
+						*new_skb = skb_clone(skb, GFP_ATOMIC);
+						if (*new_skb == NULL) {
+							DEBUG_ERR("skb_clone() failed!\n");
+						}
+						else {
+							struct vlan_info *new_info =  &vlan_info_items[VIRTUAL_IFACE_INDEX].info;
+							(*new_skb)->dev = rtl_get_virtual_dev_from_vlan_info();
+							if((*new_skb)->dev == NULL)
+								return 2;
+							//COPY_TAG((*new_skb)->tag, new_info);
+							(*new_skb)->src_info = new_info;
+							(*new_skb)->src_info->index=1;
+						}
+					}
+				}else if(memcmp(BRCST_MAC, skb->data, 6)){	 /*unicast for bridge*/
+					/*management packest are unicast!!!!*/
+					 if(is_management_packets(skb)){
+							COPY_TAG(skb->tag, (&management_vlan));
+							DEBUG_TRACE("<== Management packet from wan to bridge, carry port tag [vid=%d] and pass up\n",
+								(int)ntohs(skb->tag.f.pci&0xfff));
+							}
+					skb->dev = rtl_get_virtual_dev_from_vlan_info();
+					if(skb->dev == NULL)
+						return 1;
+				}
+#endif
+			}
+
+	}
+	
+	return 0;
+}
+#define RTL_VLAN_DEBUG 1
+#if defined(RTL_VLAN_DEBUG)
+extern int vlan_debug;
+extern void memDump (void *start, uint32 size, int8 * strHeader);
+#endif
+
+EXPORT_SYMBOL(rx_vlan_process);
+#if defined(CONFIG_RTK_VLAN_NEW_FEATURE)
+int  tx_vlan_process(struct net_device *dev, struct vlan_info *info_ori, struct sk_buff *skb, int wlan_pri)
+#else
+__IRAM_FWD
+int  tx_vlan_process(struct net_device *dev, struct vlan_info *info, struct sk_buff *skb, int wlan_pri)
+#endif
+{
+	struct vlan_tag tag, *adding_tag;
+#ifdef RTK_HW_VLAN_NEW_FEATURE
+       uint16 vid = 0;
+#if defined(CONFIG_RTL_IGMP_VLAN_SUPPORT)
+	int ret_value = 0;
+#endif
+	if(!rtl_hw_vlan_enable)
+		return 0;
+#endif
+
+#if defined(CONFIG_RTK_VLAN_NEW_FEATURE)
+	struct vlan_info *info, info_backup;
+
+	if (skb->src_info != NULL && !info_ori->is_lan) {
+		memcpy(&info_backup, skb->src_info, sizeof(struct vlan_info));    //use lan port vlan info
+		info_backup.is_lan = info_ori->is_lan;		//info is wan port
+	}
+	else{
+		memcpy(&info_backup, info_ori, sizeof(struct vlan_info));
+	}
+	info= &info_backup;
+#endif
+
+	DEBUG_TRACE("==> Process Tx packet\n");
+
+	//printk("---------%s(%d), dev(%s),skb->tag.f.tpid(0x%x)\n",__FUNCTION__,__LINE__,dev->name,skb->tag.f.tpid);
+	if (wlan_pri)
+		skb->cb[0] = '\0';		// for WMM priority
+
+	if (!info->global_vlan) {
+		DEBUG_TRACE("<== Return w/o change due to gvlan not enabled\n");
+		return 0;
+	}
+
+#ifdef RTK_HW_VLAN_NEW_FEATURE
+	if(info->is_lan)  // only lan port do drop process
+	{
+	    vid = get_skb_vid(skb);
+		if(info->forwarding_rule == 1) //Bridge out
+		{
+			
+			extern int RTK_QUERYFORBRIDGEPORT;
+			if (RTK_QUERYFORBRIDGEPORT)
+			{
+				if ((skb->tag.f.tpid == 0) && (skb->data[0]&0x01) && (skb->data[0] != 0xff) && (vid == 0))
+				{
+					return 0;//bypass igmp query /multicast packets from protocol, if needed.
+				}
+			}
+
+		   //drop vid mismatch packet 
+		   	if(vid != (unsigned short)info->id)
+			   {
+				   	DEBUG_ERR("<Drop> due to VID is not matched!\n");
+					return 1;		   	
+			    }
+		    //Eth LAN , Bridge spiecal case, UC always need to add tag in packet for HW l2 loopup.		    
+			  if((!(skb->data[0] & 0x01)) && (!memcmp(dev->name, "eth", 3)))
+			  {
+				eth_insert_vlan_tag(skb,vid);
+		   	  }
+		     	  
+		}
+		else if (info->forwarding_rule == 2) //NAT lan
+		{
+			//only drop packet not NAT vlan group
+			//if(!is_rtl_nat_vlan(skb))  //mark_wvlan
+			if(vid ==0 ) 
+				return 0; //bypass packet from protocol
+			#if defined(CONFIG_RTL_TR069_WAN)		
+			extern int rtl_get_tr069_vid(void);
+		   	if(vid == rtl_get_tr069_vid())
+	   		{
+				return 0; //bypass access tr069 from lan
+	   		}
+		
+			#endif
+			#if defined(CONFIG_RTL_IGMP_VLAN_SUPPORT)
+			if ((skb->data[0] & 0x01) && (skb->data[0] != 0xFF)){
+				if (igmp_vlan_info.global_vlan && igmp_vlan_info.vlan && igmp_vlan_info.tag && (igmp_vlan_info.id == vid)){
+					return 0;//if igmp interface vlan enabled and tagged , bypass  multicast pkt, 
+				}
+			}
+			#endif
+			//drop vid mismatch packet 
+		   	if(vid != (unsigned short)info->id)
+			{			
+	 			DEBUG_ERR("<Drop> due to NAT VID is not matched!\n");				
+				return 1;		   	    	
+			}	
+			// nat packet for lan no more tag
+		}
+	}
+	else  // wan process
+	{
+#ifndef CONFIG_RTL_8367R_SUPPORT //mark_8367, 8367 need to use autoTag to sync vlan info , so d't insert tag here
+		#if defined(CONFIG_RTL_IGMP_VLAN_SUPPORT)
+		//dut igmproxy send packets to wan, using igmpproxy vlaninfo
+		ret_value = rtl_check_igmpproxy_vlan_tagged(skb);
+		if (ret_value == 1){
+			//add tag
+			//panic_printk("%s %d igmp_vlan_info.id=%d \n", __FUNCTION__, __LINE__, igmp_vlan_info.id);
+			eth_insert_vlan_tag(skb,igmp_vlan_info.id);
+			return 0;
+		}
+		else if (ret_value == 0){
+			//no need add tag, just return, otherwise gothrough
+			return 0;
+		}
+			
+		#endif
+	    //if(((skb->data[0] & 0x01) &&(skb->data[0] != 0xFF )) && is_rtl_mc_vlan_tagged(&vid))
+	    if(((skb->data[0] & 0x01) &&(skb->data[0] != 0xFF )) && is_rtl_mc_vlan_tagged2(skb,&vid))
+  	  	   eth_insert_vlan_tag(skb,vid);	//if it is MC vlan packet and need tagout ?	    	
+	    else if( is_rtl_manage_vlan_tagged(skb,&vid)) 	    //if it is manamgat vlan packet from CPU ?	
+		   eth_insert_vlan_tag(skb,vid);		
+		#if defined(CONFIG_RTL_HW_VLAN_WIFI_BRIDGE)
+		else if (!strncmp(dev->name, RTL_DRV_LAN_P9_NETIF_NAME, strlen(RTL_DRV_LAN_P9_NETIF_NAME)))
+		{
+			//wlan tx to wan. 
+			int ret = FAILED;
+			struct vlan_info_item vlan_info;
+			if (wlan_bridge_num)
+			{
+				//drop broadcast/multicast  packets from dut to eth9 
+				if ((skb->tag.f.tpid == 0)&& (skb->data[0]&0x01)){
+#if defined(RTL_VLAN_DEBUG)
+					if (vlan_debug)
+						memDump (skb->data, 40, "VLAN1");
+#endif
+
+					//panic_printk("<Drop> due to packets from dut to eth9 !\n");				
+					return 1;	
+				}
+				ret = rtl_found_wlan_vlan_info_byvid(skb->tag.f.pci & 0xfff, &vlan_info);
+				if (ret && vlan_info.info.tag)
+				{
+					//panic_printk("%s %d ret=%d vlan_info.info.tag=%d vlan_info.info.id=%d \n", __FUNCTION__, __LINE__, ret, vlan_info.info.tag, vlan_info.info.id);
+					#if defined(CONFIG_RTL_HW_VLAN_PRI)
+					eth_insert_vlan_vid_pri(skb , vlan_info.info.id, vlan_info.info.pri);
+					#else					
+					eth_insert_vlan_tag(skb, vlan_info.info.id);
+					#endif
+				}
+
+			}
+		}
+		#endif
+	    else if( is_rtl_multi_nat_vlan(skb,&vid)) 	 
+		   eth_insert_vlan_tag(skb,vid);		
+		#if defined(CONFIG_RTL_TR069_WAN)
+		else if (!strncmp(dev->name, RTL_DRV_WAN2_NETIF_NAME, strlen(RTL_DRV_WAN2_NETIF_NAME)))
+		{
+			//add tag for tr069 wan
+			//panic_printk("%s %d info->id=%d \n", __FUNCTION__, __LINE__, info->id);
+			if (info->tag)
+			{
+				//panic_printk("%s %d info->id=%d \n", __FUNCTION__, __LINE__, info->id);
+				eth_insert_vlan_tag(skb,info->id);
+			}
+		}
+		else if ((skb->tag.f.tpid == 0)&& is_rtl_manage_vlan_tagged2(skb, &vid))
+		{
+			panic_printk("%s %d vid=%d \n", __FUNCTION__, __LINE__, vid);
+			eth_insert_vlan_tag(skb,vid);
+		}
+		#endif
+		
+#endif		
+	    // other nat packet tagga or not will control in hw (autoadd portmask) 
+	}
+	//need add wifi pri ?
+	return 0;	
+	// ignore legcy vlan process ....
+#endif
+
+	if (!info->vlan) {
+		// When port-vlan is disabled, discard packet if packet come from source port w/ vlan enabled
+		if (skb->tag.f.tpid == htons(ETH_P_8021Q)) {
+			DEBUG_ERR("<Drop> due to port-vlan is disabled but Tx packet w/o vlan enabled!\n");
+#if defined(RTL_VLAN_DEBUG)
+					if (vlan_debug)
+						memDump (skb->data, 40, "VLAN2");
+#endif
+			return 1;
+		}
+		DEBUG_TRACE("<== Return w/o change because both Tx port and source vlan not enabled\n");
+		return 0;
+	 }
+
+	// Discard packet if packet come from source port w/o vlan enabled except from protocol stack
+	if (skb->tag.f.tpid != 0) {
+		if (skb->tag.f.tpid != htons(ETH_P_8021Q)) {
+			DEBUG_ERR("<Drop> due to port-vlan is enabled but not from vlan enabled port!\n");
+#if defined(RTL_VLAN_DEBUG)
+					if (vlan_debug)
+						memDump (skb->data, 40, "VLAN3");
+#endif
+			return 1;
+		}
+
+		// Discard packet if its vid not matched, except it come from protocol stack or lan
+		if (info->is_lan && ((ntohs(skb->tag.f.pci&0xfff) != ((unsigned short)info->id)) && (ntohs(skb->tag.f.pci&0xfff) != 0xd1))) {
+			DEBUG_ERR("<Drop> due to VID is not matched!\n");
+#if defined(RTL_VLAN_DEBUG)
+					if (vlan_debug)
+						memDump (skb->data, 40, "VLAN4");
+#endif
+			return 1;
+		}
+	}
+
+
+#if defined(CONFIG_RTK_VLAN_NEW_FEATURE)
+	 if (!info->is_lan)
+	{
+		/*
+		  lan->wan: if the lan port receive this packet is tagged or this packet is original tagged,
+		  it will go out of wan port as tagged
+		 */
+		if (info->tag&0x1)
+			info->tag = 1;
+	}
+	else {
+		/*wan->lan: all packets are untag to lan, no matter lan port is tagged or not*/
+		info->tag = 0;
+	}
+	if((!memcmp(lan_macaddr,skb->data+6, 6)) && (info->forwarding_rule==1) && (skb->data[37] == 68))
+	{
+	#if defined(RTL_VLAN_DEBUG)
+					if (vlan_debug)
+						memDump (skb->data, 40, "VLAN5");
+#endif
+		return 1;
+	}
+#endif
+#if defined(CONFIG_RTK_VLAN_FOR_CABLE_MODEM)
+	if(rtk_vlan_support_enable == 1)
+#endif
+			if (!info->tag)
+			{
+				//printk("[%s][%d]-skb->dev[%s],proto(0x%x)\n", __FUNCTION__, __LINE__, skb->dev->name,skb->protocol);
+				DEBUG_TRACE("<== Return w/o tagging\n");
+				if (wlan_pri) {
+					if (!info->is_lan &&  skb->tag.f.tpid == htons(ETH_P_8021Q))
+						skb->cb[0] = (unsigned char)((ntohs(skb->tag.f.pci)>>13)&0x7);
+					else
+						skb->cb[0] = (unsigned char)info->pri;
+				}
+
+				return 0;
+			}
+
+		// Add tagging
+
+	//	if (!info->is_lan && skb->tag && skb->tag.f.tpid != 0) { // WAN port and not from local, add source tag
+		if (skb->tag.f.tpid != 0) { // WAN port and not from local, add source tag
+#if defined(CONFIG_RTK_VLAN_NEW_FEATURE)
+			struct vlan_info_item *item = rtl_get_vlan_info_item_by_vid(skb->tag.f.pci & 0xfff);
+			if( item && item->info.forwarding_rule == 0 ) { //check if packet form VLAN that disable traffic to/from  WAN
+				DEBUG_ERR("<Drop> due to VLAN is disabled\n");
+				#if defined(RTL_VLAN_DEBUG)
+					if (vlan_debug)
+						memDump (skb->data, 40, "VLAN6");
+#endif
+				return 1;
+			} else
+#endif
+			{
+				adding_tag = &skb->tag;
+				DEBUG_TRACE("---%s(%d) source port tagging [vid=%d]\n",__FUNCTION__,__LINE__, (int)ntohs(skb->tag.f.pci&0xfff));
+			}
+		}
+		else {
+			adding_tag = NULL;
+			DEBUG_TRACE("---%s(%d)	 Return w/ port tagging [vid=%d]\n", __FUNCTION__,__LINE__,info->id);
+		}
+
+#if defined(CONFIG_RTK_VLAN_FOR_CABLE_MODEM)
+		if(rtk_vlan_support_enable == 2 && adding_tag == NULL)
+			return 0;
+#endif
+
+		memcpy(&tag, skb->data+ETH_ALEN*2, VLAN_HLEN);
+		if (tag.f.tpid !=  htons(ETH_P_8021Q)) { // tag not existed, insert tag
+			if (skb_headroom(skb) < VLAN_HLEN && skb_cow(skb, VLAN_HLEN) !=0 ) {
+				printk("%s-%d: error! (skb_headroom(skb) == %d < 4). Enlarge it!\n",
+				__FUNCTION__, __LINE__, skb_headroom(skb));
+				while (1) ;
+			}
+			skb_push(skb, VLAN_HLEN);
+			memmove(skb->data, skb->data+VLAN_HLEN, ETH_ALEN*2);
+		}
+
+		if (!adding_tag)	{ // add self-tag
+			COPY_TAG(tag, info);
+			adding_tag = &tag;
+		}
+
+		memcpy(skb->data+ETH_ALEN*2, adding_tag, VLAN_HLEN);
+
+		if (wlan_pri)
+			skb->cb[0] = (unsigned char)((ntohs(adding_tag->f.pci)>>13)&0x7);
+		return 0;
+}
+
+EXPORT_SYMBOL(tx_vlan_process);
+
